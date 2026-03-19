@@ -1,0 +1,10 @@
+langchain
+langchain-community
+langchain-openai
+langchain-anthropic
+langgraph
+langgraph-supervisor
+langgraph-bigtool
+python-dotenv>=1.0.0
+rich>=13.0.0
+faiss-cpu>=1.7.4
