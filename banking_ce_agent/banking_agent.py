@@ -15,6 +15,17 @@ Usage:
     cp .env.example .env        # paste your OpenAI API key
     python banking_agent.py
 ─────────────────────────────────────────────────────────────────────────────
+
+───────────────────────────────
+Demo Prompt for Testing:
+───────────────────────────────
+Hi! My account ID is ACC001. Can you check my balance and recent transactions?
+I see a suspicious night transfer of Rs.1,20,000 on 2026-03-12. Please investigate.
+I want to apply for a personal loan of Rs.10,00,000. Am I eligible?
+If I get the loan at 10.5% for 48 months, what will my EMI be?
+What are the UPI daily limits? I want to transfer Rs.90,000 to a new contact.
+Check my account and tell me if there are any alerts.
+
 """
 
 import os
@@ -35,7 +46,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Tool
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain.tools.retriever import create_retriever_tool
+from langchain_core.tools import Tool
 
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.memory import InMemorySaver
@@ -60,7 +71,7 @@ console = Console()
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_llm(model: str = "openai/gpt-4o", temperature: float = 0):
+def build_llm(model: str = "gpt-4o-mini", temperature: float = 0):
     # Use ChatOpenAI for OpenAI models; update as needed for Anthropic/Gemini
     return ChatOpenAI(model=model, temperature=temperature)
 
@@ -112,14 +123,19 @@ def build_rag_retriever(llm):
     vectorstore = FAISS.from_documents(splits, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    retriever_tool = create_retriever_tool(
-        retriever,
+    def _search_banking_policy(query: str) -> str:
+        docs = retriever.get_relevant_documents(query)
+        return "\n\n".join(d.page_content for d in docs)
+
+    retriever_tool = Tool(
         name="search_banking_policy",
         description=(
             "Search the bank's internal policy documents. Use this to answer questions "
             "about loan eligibility criteria, fraud rules, account features, UPI limits, "
             "interest rates, grievance procedures, and KYC requirements."
         ),
+        func=_search_banking_policy,
+        args_schema=None,
     )
     return retriever_tool
 
@@ -161,6 +177,14 @@ Given the full conversation so far, write a concise 3-5 sentence summary capturi
 - Any actions taken (loans checked, fraud flagged, tickets raised)
 - Outstanding issues or next steps
 Keep it factual and brief."""
+
+SUPERVISOR_COMPRESS_PROMPT = """You are a banking supervisor session summariser.
+Given the prior summary and recent interactions for a specific customer account, write a concise 3-5 sentence summary capturing:
+- The customer's account ID
+- Key topics across all their queries (fraud, loans, support, UPI, etc.)
+- Actions taken (fraud flagged, loan eligibility checked, tickets raised, etc.)
+- Outstanding issues or pending follow-ups
+Keep it factual, brief, and strictly scoped to this customer."""
 
 
 # ── Node functions ─────────────────────────────────────────────────────────────
@@ -236,13 +260,21 @@ def banking_llm_node(state: BankingState, store: BaseStore) -> dict:
 
     # Detect account ID mentions to update scratchpad (WRITE)
     updates: dict = {"messages": [response], "interaction_count": state.get("interaction_count", 0) + 1}
-    for acc_id in ["ACC001", "ACC002", "ACC003"]:
-        # Check all user messages for account mentions
+    # If we already have a current_account, keep it
+    current_account = state.get("current_account")
+    # Search for account IDs in user messages if not already set
+    if not current_account:
         for msg in state["messages"]:
-            if hasattr(msg, "content") and acc_id in str(msg.content):
-                updates["current_account"] = acc_id
-                break
-
+            if hasattr(msg, "content"):
+                content = str(msg.content)
+                # Look for any pattern like ACC followed by 3+ digits
+                import re
+                match = re.search(r"ACC\d{3,}", content)
+                if match:
+                    current_account = match.group(0)
+                    break
+    if current_account:
+        updates["current_account"] = current_account
     return updates
 
 
@@ -271,10 +303,36 @@ def tool_executor_node(state: BankingState) -> dict:
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
+        tool_call_id = tool_call["id"]
 
-        # Handle RAG tool separately (it's not in our tools map)
+        # List of tools that require account_id
+        tools_require_account = {
+            "get_account_balance", "get_transaction_history", "check_loan_eligibility",
+            "flag_suspicious_transaction", "get_active_alerts", "raise_support_ticket",
+            "check_upi_limit", "get_customer_profile"
+        }
+
+        # If the tool requires account_id and it's missing, prompt the user only now
+        if tool_name in tools_require_account and ("account_id" not in tool_args or not tool_args.get("account_id")):
+            tool_messages.append(
+                ToolMessage(
+                    content="To proceed, please provide your account ID (e.g., ACC001).",
+                    tool_call_id=tool_call_id
+                )
+            )
+            continue
+
+        # Handle RAG tool (search_banking_policy) by invoking via LLM's bound tools
         if tool_name == "search_banking_policy":
-            # This will be executed by the LLM's bound tools — skip manual execution
+            llm = build_llm()
+            rag_tool = build_rag_retriever(llm)
+            try:
+                result = rag_tool.invoke(tool_args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            tool_messages.append(
+                ToolMessage(content=str(result), tool_call_id=tool_call_id)
+            )
             continue
 
         tool_fn = all_tools_map.get(tool_name)
@@ -298,7 +356,7 @@ def tool_executor_node(state: BankingState) -> dict:
             })
 
         tool_messages.append(
-            ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+            ToolMessage(content=str(result), tool_call_id=tool_call_id)
         )
 
     updates: dict = {"messages": tool_messages}
@@ -418,13 +476,17 @@ If a query spans multiple domains, break it down and delegate each part separate
 Always provide a final consolidated response after agents complete their work."""
 
 
-def build_supervisor_graph(llm):
+def build_supervisor_graph(llm, store: InMemoryStore):
     """
-    ISOLATE strategy:
-    Three specialist agents each with their own isolated context window
-    and domain-specific tool sets. A supervisor routes queries.
+    ISOLATE + WRITE + COMPRESS strategy:
+    - Three specialist agents with isolated, domain-scoped tool sets (ISOLATE)
+    - Per-account InMemoryStore for cross-query memory, keyed by account ID (WRITE)
+    - Every 3 queries per account, summarise and persist to store (COMPRESS)
+    - RAG retriever available to support_agent (SELECT)
     """
-    # Each agent only gets domain-relevant tools → context isolation
+    import re as _re
+
+    # Each agent only gets domain-relevant tools → context isolation (ISOLATE)
     fraud_agent = create_react_agent(
         model=llm,
         tools=[get_transaction_history, flag_suspicious_transaction, get_active_alerts],
@@ -447,13 +509,87 @@ def build_supervisor_graph(llm):
         prompt=SUPPORT_AGENT_PROMPT,
     )
 
-    # Build supervisor using LangGraph MessagesState + conditional routing
     from langgraph.graph import MessagesState as MS
 
     class SupervisorState(MS):
         next_agent: str
+        current_account: str   # WRITE: scopes store namespace per user
+        query_count: int       # WRITE: tracks queries for COMPRESS trigger
+        session_summary: str   # COMPRESS: rolling per-account summary
+
+    def _extract_account(messages: list) -> str:
+        """Extract account ID from the most recent HumanMessage."""
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                m = _re.search(r"ACC\d{3,}", str(msg.content))
+                if m:
+                    return m.group(0)
+        return "anonymous"
+
+    def _get_account_memory(account_id: str) -> dict:
+        """SELECT: Retrieve this account's stored memory from the store."""
+        namespace = ("supervisor_sessions", account_id)
+        memories = list(store.search(namespace))
+        return memories[0].value if memories else {}
+
+    def _save_interaction(account_id: str, query: str, response: str):
+        """WRITE: Append the latest interaction to per-account store."""
+        namespace = ("supervisor_sessions", account_id)
+        memory = _get_account_memory(account_id)
+        interactions = memory.get("interactions", [])
+        interactions.append({"query": query[:200], "response": response[:300]})
+        store.put(namespace, "context", {
+            "summary": memory.get("summary", ""),
+            "interactions": interactions[-5:],  # retain last 5 interactions
+        })
+        console.print(Panel(
+            f"Saved interaction #{len(interactions)} for [bold]{account_id}[/bold] to memory store.\n"
+            f"[dim]Q: {query[:120]}[/dim]",
+            title="[bold yellow]✍️  WRITE — Interaction Saved to Memory[/bold yellow]",
+            border_style="yellow",
+        ))
+
+    def _maybe_compress(account_id: str, query_count: int) -> str:
+        """COMPRESS: Every 3 queries, summarise all interactions and persist."""
+        if query_count > 0 and query_count % 3 == 0:
+            memory = _get_account_memory(account_id)
+            prior_summary = memory.get("summary", "")
+            interactions = memory.get("interactions", [])
+            interaction_text = "\n".join(
+                f"Q: {i['query']}\nA: {i['response']}" for i in interactions
+            )
+            summary_response = llm.invoke([
+                SystemMessage(content=SUPERVISOR_COMPRESS_PROMPT),
+                HumanMessage(content=(
+                    f"Account: {account_id}\n"
+                    f"Prior summary:\n{prior_summary}\n\n"
+                    f"Recent interactions:\n{interaction_text}"
+                )),
+            ])
+            new_summary = summary_response.content
+            namespace = ("supervisor_sessions", account_id)
+            store.put(namespace, "context", {"summary": new_summary, "interactions": []})
+            console.print(Panel(
+                f"[italic]{new_summary}[/italic]",
+                title=f"[bold green]🗜️  Memory Compressed for [{account_id}][/bold green]",
+                border_style="green",
+            ))
+            return new_summary
+        return ""
 
     def supervisor_node(state: SupervisorState) -> dict:
+        # WRITE: determine and persist current account for this query
+        account_id = state.get("current_account") or _extract_account(state["messages"])
+
+        # SELECT: inject per-account memory into supervisor prompt
+        memory = _get_account_memory(account_id)
+        prior_summary = memory.get("summary", "")
+        system_content = SUPERVISOR_PROMPT
+        if prior_summary:
+            system_content += f"\n\n[Prior session memory for account {account_id}]\n{prior_summary}"
+        if state.get("session_summary"):
+            system_content += f"\n\n[Current session summary for account {account_id}]\n{state['session_summary']}"
+
         supervisor_llm = llm.bind_tools([
             {"type": "function", "function": {
                 "name": "route",
@@ -469,27 +605,94 @@ def build_supervisor_graph(llm):
             }}
         ], tool_choice={"type": "function", "function": {"name": "route"}})
 
+        # Show SELECT signal if memory is being injected
+        if prior_summary:
+            console.print(Panel(
+                f"[dim]Injecting prior memory for [{account_id}] into supervisor context.[/dim]\n"
+                f"[italic]{prior_summary[:300]}{'...' if len(prior_summary) > 300 else ''}[/italic]",
+                title="[bold cyan]🔍 SELECT — Prior Memory Injected[/bold cyan]",
+                border_style="cyan",
+            ))
+
         response = supervisor_llm.invoke(
-            [SystemMessage(content=SUPERVISOR_PROMPT)] + state["messages"]
+            [SystemMessage(content=system_content)] + state["messages"]
         )
         tool_call = response.tool_calls[0]["args"] if response.tool_calls else {"agent": "FINISH", "reason": "done"}
-        return {"next_agent": tool_call["agent"], "messages": [response]}
+
+        # Show ISOLATE signal — which specialist was selected and why
+        agent_selected = tool_call['agent']
+        console.print(Panel(
+            f"Routing to [bold]{agent_selected}[/bold]\nReason: [italic]{tool_call.get('reason', '')}[/italic]",
+            title="[bold magenta]🔀 ISOLATE — Supervisor Routing Decision[/bold magenta]",
+            border_style="magenta",
+        ))
+
+        return {
+            "next_agent": agent_selected,
+            "current_account": account_id,
+            "query_count": state.get("query_count", 0) + 1,
+        }
 
     def route_to_agent(state: SupervisorState) -> str:
         agent = state.get("next_agent", "FINISH")
         return agent if agent != "FINISH" else END
 
+    def _human_messages_with_context(state: SupervisorState) -> list:
+        """Pass only HumanMessages to sub-agents + inject account memory as SystemMessage."""
+        account_id = state.get("current_account", "anonymous")
+        memory = _get_account_memory(account_id)
+        prior_summary = memory.get("summary", "")
+        human_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+        if prior_summary:
+            console.print(Panel(
+                f"[dim]Injecting stored memory for [{account_id}] into sub-agent context.[/dim]\n"
+                f"[italic]{prior_summary[:300]}{'...' if len(prior_summary) > 300 else ''}[/italic]",
+                title="[bold cyan]🔍 SELECT — Memory Injected into Sub-Agent[/bold cyan]",
+                border_style="cyan",
+            ))
+            return [
+                SystemMessage(content=f"[Prior context for account {account_id}]\n{prior_summary}")
+            ] + human_msgs
+        return human_msgs
+
+    def _last_human_query(state: SupervisorState) -> str:
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                return str(msg.content)
+        return ""
+
     def run_fraud_agent(state: SupervisorState) -> dict:
-        result = fraud_agent.invoke({"messages": state["messages"]})
-        return {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        result = fraud_agent.invoke({"messages": _human_messages_with_context(state)})
+        response_text = str(result["messages"][-1].content) if result["messages"] else ""
+        account_id = state.get("current_account", "anonymous")
+        _save_interaction(account_id, _last_human_query(state), response_text)
+        new_summary = _maybe_compress(account_id, state.get("query_count", 0))
+        updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        if new_summary:
+            updates["session_summary"] = new_summary
+        return updates
 
     def run_loan_agent(state: SupervisorState) -> dict:
-        result = loan_agent.invoke({"messages": state["messages"]})
-        return {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        result = loan_agent.invoke({"messages": _human_messages_with_context(state)})
+        response_text = str(result["messages"][-1].content) if result["messages"] else ""
+        account_id = state.get("current_account", "anonymous")
+        _save_interaction(account_id, _last_human_query(state), response_text)
+        new_summary = _maybe_compress(account_id, state.get("query_count", 0))
+        updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        if new_summary:
+            updates["session_summary"] = new_summary
+        return updates
 
     def run_support_agent(state: SupervisorState) -> dict:
-        result = support_agent.invoke({"messages": state["messages"]})
-        return {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        result = support_agent.invoke({"messages": _human_messages_with_context(state)})
+        response_text = str(result["messages"][-1].content) if result["messages"] else ""
+        account_id = state.get("current_account", "anonymous")
+        _save_interaction(account_id, _last_human_query(state), response_text)
+        new_summary = _maybe_compress(account_id, state.get("query_count", 0))
+        updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
+        if new_summary:
+            updates["session_summary"] = new_summary
+        return updates
 
     builder = StateGraph(SupervisorState)
     builder.add_node("supervisor",    supervisor_node)
@@ -569,8 +772,12 @@ def run_single_agent_demo():
         section(f"Turn  [{account_id}]")
         console.print(Panel(query, title="[bold green]🧑 User[/bold green]", border_style="green"))
 
-        current_state["messages"] = [HumanMessage(content=query)]
+
+        # Always set current_account from the demo tuple
         current_state["current_account"] = account_id
+        # Append account_id to the message content for tool context
+        user_message = f"[Account: {account_id}] {query}"
+        current_state["messages"] = [HumanMessage(content=user_message)]
 
         result = graph.invoke(current_state, config=config)
         print_messages(result["messages"][-3:])
@@ -583,23 +790,41 @@ def run_single_agent_demo():
 
 
 def run_supervisor_demo():
-    """Run the supervisor multi-agent demo showcasing ISOLATE strategy."""
-    section("SUPERVISOR MULTI-AGENT DEMO  (ISOLATE strategy)")
+    """Run the supervisor multi-agent demo showcasing ISOLATE + WRITE + COMPRESS strategies."""
+    section("SUPERVISOR MULTI-AGENT DEMO  (ISOLATE · WRITE · COMPRESS · SELECT)")
     console.print(
         "[bold]Supervisor routes each query to the right specialist agent "
-        "(fraud / loan / support).[/bold]\n"
+        "(fraud / loan / support). Per-account memory is stored and compressed across queries.[/bold]\n"
     )
 
     llm = build_llm()
-    supervisor_graph = build_supervisor_graph(llm)
+    # WRITE: shared store, keyed per account — different accounts never share memory
+    store = InMemoryStore()
+    supervisor_graph = build_supervisor_graph(llm, store)
+
+    # Track per-account query counts and session summaries across queries
+    account_query_counts: dict = {}
+    account_summaries: dict = {}
 
     for account_id, query in SUPERVISOR_DEMO_QUERIES:
         section(f"Supervisor Query  [{account_id}]")
         tagged_query = f"[Account: {account_id}] {query}"
         console.print(Panel(tagged_query, title="[bold green]🧑 User[/bold green]", border_style="green"))
 
-        result = supervisor_graph.invoke({"messages": [HumanMessage(content=tagged_query)]})
+        account_query_counts[account_id] = account_query_counts.get(account_id, 0)
+        result = supervisor_graph.invoke({
+            "messages": [HumanMessage(content=tagged_query)],
+            "current_account": account_id,
+            "query_count": account_query_counts[account_id],
+            "session_summary": account_summaries.get(account_id, ""),
+            "next_agent": "",
+        })
         print_messages(result["messages"][-3:])
+
+        # Carry over per-account state for next query
+        account_query_counts[account_id] = result.get("query_count", account_query_counts[account_id])
+        if result.get("session_summary"):
+            account_summaries[account_id] = result["session_summary"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -621,6 +846,6 @@ if __name__ == "__main__":
         run_supervisor_demo()
     elif mode == "both":
         run_single_agent_demo()
-        run_supervisor_demo()
     else:
+        run_supervisor_demo()
         run_single_agent_demo()
