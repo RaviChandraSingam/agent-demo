@@ -1,10 +1,10 @@
-Great — I've fully read through the codebase. Here's a comprehensive breakdown of what's needed to make this a **production-grade application**, with a deep focus on the **conversation storage problem in a distributed environment**.
+Here's a comprehensive breakdown of what's needed to make this a **production-grade application**, with a deep focus on the **conversation storage problem in a distributed environment**.
 
 ---
 
 ## 🏭 Making `agent-demo` Production-Grade
 
-### 🔴 The Core Problem: Everything is In-Memory
+### 🔴 Everything from In-Memory to Persistent store
 
 Right now the app uses:
 - `InMemoryStore` — for long-term conversation summaries
