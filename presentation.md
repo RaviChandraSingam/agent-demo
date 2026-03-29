@@ -486,7 +486,76 @@ def _human_messages_with_context(state):
 
 ---
 
-<!-- Slide 18: Project Structure -->
+<!-- Slide 18: Memory is Context, Not a Cache -->
+# 🧠 Memory is Context, Not a Cache
+
+> **Common misconception:** "Storing in memory means the LLM is skipped for repeated questions."
+> **Reality:** Memory here is *injected into the prompt* — the LLM always runs.
+
+### Why? Deliberate design choice for banking:
+
+```
+❌  Return cached "balance: ₹1,23,456"  →  stale, potentially harmful
+✅  Call get_account_balance() live      →  fresh, accurate, safe
+```
+
+The terminal makes this explicit on every query:
+
+```
+→ This context is INJECTED into the LLM prompt.
+→ Tools will still be called for fresh, live data —
+  memory does NOT replace tool calls.
+```
+
+### What memory *does* provide:
+- Customer doesn't repeat account ID, fraud history, loan status every session
+- Cross-session continuity — returning customer picks up where they left off
+- Per-account namespace isolation — ACC001 context never leaks to ACC002
+
+### To add real response caching (for static policy queries only):
+```python
+from langchain.globals import set_llm_cache
+from langchain_community.cache import InMemorySemanticCache
+set_llm_cache(InMemorySemanticCache(embedding=OpenAIEmbeddings(),
+                                    score_threshold=0.95))
+```
+> ⚠️ Never cache live account data — only static policy queries (UPI limits, loan criteria, FD rates)
+
+---
+
+<!-- Slide 19: How COMPRESS Saves Cost -->
+# 🗜️ How COMPRESS Saves LLM Cost
+
+> COMPRESS is the real cost optimisation — it keeps token count **bounded and predictable**.
+
+### Without COMPRESS: tokens grow without limit
+
+```
+Turn  1:   ~400 tokens
+Turn  5:  ~2,500 tokens
+Turn 10:  ~8,000 tokens   ← cost spikes
+Turn 30: ~25,000 tokens   ← approaching context limits
+```
+
+### With COMPRESS: tokens stay flat after every 3 turns
+
+```
+Turn  1:   ~400 tokens
+Turn  3:  compress  →  1 summary + last 6 messages  →  ~1,500 tokens
+Turn  6:  compress  →  1 summary + last 6 messages  →  ~1,500 tokens
+Turn 30:  compress  →  1 summary + last 6 messages  →  ~1,500 tokens ✅
+```
+
+### What compress_node does:
+1. Sends full history to LLM → 3–5 sentence summary (COMPRESS)
+2. Persists summary to `InMemoryStore` (WRITE)
+3. Replaces message list with last 6 messages only
+
+**Saving:** ~80–95% fewer tokens per call after turn 10+ with no loss of key context.
+
+---
+
+<!-- Slide 20: Project Structure -->
 # Project Structure
 
 ```
