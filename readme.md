@@ -2,6 +2,10 @@
 
 A **Contextual Engineering** demo featuring an AI-powered banking customer-experience agent built with LangGraph and LangChain. The project showcases all four CE strategies in a realistic banking domain.
 
+https://blog.langchain.com/context-engineering-for-agents/
+
+
+
 ---
 
 ## Contextual Engineering Strategies
@@ -10,8 +14,8 @@ A **Contextual Engineering** demo featuring an AI-powered banking customer-exper
 |----------|---------------|
 | **WRITE** | LangGraph `StateGraph` scratchpad (`BankingState`) + `InMemoryStore` for cross-session long-term memory |
 | **SELECT** | RAG over an internal banking knowledge base (loan policies, fraud rules, UPI limits, grievance procedures) |
-| **COMPRESS** | On-the-fly conversation summarisation every 3 turns; trimmed message history to prevent context overflow |
-| **ISOLATE** | Supervisor multi-agent system with three specialist agents (`fraud_agent`, `loan_agent`, `support_agent`), each with its own isolated context window and domain-scoped tool set |
+| **COMPRESS** | On-the-fly conversation summarisation every 3 turns (single agent) / every 3 queries per account (supervisor); message history trimmed to last 6 to prevent context overflow; summaries persisted to `InMemoryStore` |
+| **ISOLATE** | Supervisor multi-agent system with three specialist agents (`fraud_agent`, `loan_agent`, `support_agent`), each with its own isolated context window and domain-scoped tool set; prior account memory is also injected into each sub-agent (SELECT) |
 
 ---
 
@@ -70,15 +74,37 @@ OPENAI_API_KEY=sk-...
 ## Usage
 
 ```bash
-# Single agent demo (WRITE · SELECT · COMPRESS)
+# Interactive chat — supervisor mode (default)
 python banking_agent.py
+python banking_agent.py chat
 
-# Supervisor multi-agent demo (ISOLATE)
+# Interactive chat — single-agent mode
+python banking_agent.py chat single
+
+# Scripted single-agent demo (WRITE · SELECT · COMPRESS)
+python banking_agent.py single
+
+# Scripted supervisor multi-agent demo (ISOLATE · WRITE · COMPRESS · SELECT)
 python banking_agent.py supervisor
 
-# Run both demos sequentially
+# Run both scripted demos sequentially
 python banking_agent.py both
 ```
+
+### Interactive Chat
+
+The default entry point launches an interactive chat session. Type any banking query at the prompt and press Enter. The agent will route your message, call relevant tools, and respond in real time.
+
+```
+You> My account is ACC001. Check my balance.
+You> I see a suspicious transfer — please investigate.
+You> exit
+```
+
+- In **supervisor mode** (default), queries are routed to the appropriate specialist (`fraud_agent`, `loan_agent`, or `support_agent`). If your message contains an account ID (`ACC001` etc.) it is extracted automatically; otherwise the shell prompts you for one.
+- In **single-agent mode**, all queries are handled by a single graph with full tool access.
+- Memory is displayed before each query — a **MEMORY HIT** panel shows prior context being injected; a **MEMORY MISS** panel confirms a fresh start.
+- Type `exit`, `quit`, or `q` to end the session.
 
 ---
 
@@ -94,7 +120,7 @@ START → [llm node] ──tool calls?──► [tool executor] ──► [llm n
 
 - `banking_llm_node` — binds all tools + RAG retriever, reads scratchpad from state
 - `tool_executor_node` — runs tool calls, writes fraud flags / loan context back to state
-- `compress_node` — summarises conversation, persists to `InMemoryStore`, trims message history
+- `compress_node` — summarises conversation every 3 interaction turns, persists to `InMemoryStore`, trims message history to last 6 messages
 
 ### Supervisor Multi-Agent (supervisor mode)
 
@@ -104,7 +130,7 @@ START → [supervisor] ──routes──► [fraud_agent]   ──► END
                                ► [support_agent] ──► END
 ```
 
-Each specialist agent receives only the tools relevant to its domain, ensuring true context isolation.
+Each specialist agent receives only the tools relevant to its domain, ensuring true context isolation. Prior account memory (summary + last 5 interactions) is also injected into each sub-agent as a `SystemMessage`, applying the SELECT strategy within isolated contexts. Compression runs every 3 queries per account and resets the interaction log.
 
 ---
 

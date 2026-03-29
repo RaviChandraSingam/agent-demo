@@ -17,7 +17,7 @@ Usage:
 ─────────────────────────────────────────────────────────────────────────────
 
 ───────────────────────────────
-Demo Prompt for Testing:
+ Prompt for Testing:
 ───────────────────────────────
 Hi! My account ID is ACC001. Can you check my balance and recent transactions?
 I see a suspicious night transfer of Rs.1,20,000 on 2026-03-12. Please investigate.
@@ -100,6 +100,39 @@ def print_messages(messages: list):
             console.print(Panel(str(msg.content)[:600] + ("..." if len(str(msg.content)) > 600 else ""),
                                 title="[bold magenta]⚙️  Tool Result[/bold magenta]",
                                 border_style="magenta"))
+
+
+def print_memory_status(account_id: str, store: InMemoryStore, namespace_prefix: str = "supervisor_sessions"):
+    """
+    Print what memory (if any) exists for this account before the query is processed.
+    Clarifies whether the agent will be informed by prior context or starting fresh.
+    Memory provides CONTEXT to the LLM — tools are always called for live data.
+    """
+    namespace = (namespace_prefix, account_id)
+    memories = list(store.search(namespace))
+    if memories:
+        mem = memories[0].value
+        summary = mem.get("summary", "")
+        interactions = mem.get("interactions", [])
+        lines = []
+        if summary:
+            lines.append(f"[bold]Stored summary:[/bold] {summary[:250]}{'...' if len(summary) > 250 else ''}")
+        if interactions:
+            lines.append(f"[bold]Stored interactions:[/bold] {len(interactions)} entry/entries cached")
+        lines.append("")
+        lines.append("[italic dim]→ This context is INJECTED into the LLM prompt.[/italic dim]")
+        lines.append("[italic dim]→ Tools will still be called for fresh, live data — memory does NOT replace tool calls.[/italic dim]")
+        console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold cyan]🧠 MEMORY HIT — Prior context found for {account_id}[/bold cyan]",
+            border_style="cyan",
+        ))
+    else:
+        console.print(Panel(
+            f"[dim]No prior memory for {account_id}. Starting fresh — all data will be fetched via tools.[/dim]",
+            title=f"[bold dim]🧠 MEMORY MISS — No prior context for {account_id}[/bold dim]",
+            border_style="dim",
+        ))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -661,10 +694,34 @@ def build_supervisor_graph(llm, store: InMemoryStore):
                 return str(msg.content)
         return ""
 
+    def _print_agent_internals(agent_name: str, messages: list):
+        """Print tool calls and tool results from inside a sub-agent's execution."""
+        internal = [m for m in messages if not isinstance(m, HumanMessage)]
+        if not internal:
+            return
+        # Show header so it's clear these are sub-agent internals
+        console.print(f"[dim]  ┌─ {agent_name} internal steps ({'→'.join(type(m).__name__ for m in internal)})[/dim]")
+        for msg in internal[:-1]:  # all but final response (printed separately)
+            if isinstance(msg, AIMessage):
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        console.print(Panel(
+                            f"Tool: [bold yellow]{tc['name']}[/bold yellow]\nArgs: {tc['args']}",
+                            title=f"[bold yellow]🔧 {agent_name} → Tool Call[/bold yellow]",
+                            border_style="yellow",
+                        ))
+            elif isinstance(msg, ToolMessage):
+                console.print(Panel(
+                    str(msg.content)[:600] + ("..." if len(str(msg.content)) > 600 else ""),
+                    title=f"[bold magenta]⚙️  {agent_name} → Tool Result[/bold magenta]",
+                    border_style="magenta",
+                ))
+
     def run_fraud_agent(state: SupervisorState) -> dict:
         result = fraud_agent.invoke({"messages": _human_messages_with_context(state)})
         response_text = str(result["messages"][-1].content) if result["messages"] else ""
         account_id = state.get("current_account", "anonymous")
+        _print_agent_internals("fraud_agent", result["messages"])
         _save_interaction(account_id, _last_human_query(state), response_text)
         new_summary = _maybe_compress(account_id, state.get("query_count", 0))
         updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
@@ -676,6 +733,7 @@ def build_supervisor_graph(llm, store: InMemoryStore):
         result = loan_agent.invoke({"messages": _human_messages_with_context(state)})
         response_text = str(result["messages"][-1].content) if result["messages"] else ""
         account_id = state.get("current_account", "anonymous")
+        _print_agent_internals("loan_agent", result["messages"])
         _save_interaction(account_id, _last_human_query(state), response_text)
         new_summary = _maybe_compress(account_id, state.get("query_count", 0))
         updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
@@ -687,6 +745,7 @@ def build_supervisor_graph(llm, store: InMemoryStore):
         result = support_agent.invoke({"messages": _human_messages_with_context(state)})
         response_text = str(result["messages"][-1].content) if result["messages"] else ""
         account_id = state.get("current_account", "anonymous")
+        _print_agent_internals("support_agent", result["messages"])
         _save_interaction(account_id, _last_human_query(state), response_text)
         new_summary = _maybe_compress(account_id, state.get("query_count", 0))
         updates = {"messages": result["messages"][-1:], "next_agent": "FINISH"}
@@ -723,7 +782,7 @@ SINGLE_AGENT_DEMO_QUERIES = [
     ("ACC001", "I see a suspicious night transfer of Rs.1,20,000 on 2026-03-12. Please investigate."),
     ("ACC001", "I want to apply for a personal loan of Rs.10,00,000. Am I eligible?"),
     ("ACC001", "If I get the loan at 10.5% for 48 months, what will my EMI be?"),
-    ("ACC001", "What are the UPI daily limits? I want to transfer Rs.90,000 to a new contact."),
+    ("ACC001", "What  UPI daily limits? are theI want to transfer Rs.90,000 to a new contact."),
     ("ACC002", "Check my account and tell me if there are any alerts."),
 ]
 
@@ -828,6 +887,117 @@ def run_supervisor_demo():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 6. INTERACTIVE CHAT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_chat(mode: str = "supervisor"):
+    """
+    Interactive chat loop — type queries and get live responses.
+    Supports 'single' (single-agent) and 'supervisor' (multi-agent) modes.
+    Type 'exit' or 'quit' to end the session.
+    """
+    section(f"INTERACTIVE CHAT  (mode: {mode})")
+    console.print(
+        "[bold]Type your banking query and press Enter. "
+        "Type [red]exit[/red] or [red]quit[/red] to end the session.[/bold]\n"
+    )
+
+    if mode == "supervisor":
+        llm = build_llm()
+        store = InMemoryStore()
+        graph = build_supervisor_graph(llm, store)
+
+        account_query_counts: dict = {}
+        account_summaries: dict = {}
+
+        while True:
+            try:
+                raw = console.input("[bold green]You>[/bold green] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Session ended.[/dim]")
+                break
+
+            if raw.lower() in {"exit", "quit", "q"}:
+                console.print("[dim]Goodbye![/dim]")
+                break
+            if not raw:
+                continue
+
+            # Extract or prompt for account ID
+            import re as _re
+            m = _re.search(r"ACC\d{3,}", raw)
+            if m:
+                account_id = m.group(0)
+            else:
+                account_id = console.input(
+                    "[yellow]Account ID not found in message. Enter account ID (e.g. ACC001): [/yellow]"
+                ).strip() or "ACCGUEST"
+                raw = f"[Account: {account_id}] {raw}"
+
+            account_query_counts[account_id] = account_query_counts.get(account_id, 0)
+            print_memory_status(account_id, store, "supervisor_sessions")
+            result = graph.invoke({
+                "messages": [HumanMessage(content=raw)],
+                "current_account": account_id,
+                "query_count": account_query_counts[account_id],
+                "session_summary": account_summaries.get(account_id, ""),
+                "next_agent": "",
+            })
+            print_messages(result["messages"][-3:])
+
+            account_query_counts[account_id] = result.get("query_count", account_query_counts[account_id])
+            if result.get("session_summary"):
+                account_summaries[account_id] = result["session_summary"]
+
+    else:  # single-agent mode
+        store = InMemoryStore()
+        checkpointer = InMemorySaver()
+        graph = build_single_agent_graph(store, checkpointer)
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        current_state: dict = {
+            "messages": [],
+            "current_account": "",
+            "fraud_flags": [],
+            "loan_context": {},
+            "session_summary": "",
+            "interaction_count": 0,
+        }
+
+        while True:
+            try:
+                raw = console.input("[bold green]You>[/bold green] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Session ended.[/dim]")
+                break
+
+            if raw.lower() in {"exit", "quit", "q"}:
+                console.print("[dim]Goodbye![/dim]")
+                break
+            if not raw:
+                continue
+
+            import re as _re
+            m = _re.search(r"ACC\d{3,}", raw)
+            account_id = m.group(0) if m else current_state.get("current_account") or "ACCGUEST"
+
+            current_state["current_account"] = account_id
+            current_state["messages"] = [HumanMessage(content=f"[Account: {account_id}] {raw}")]
+
+            print_memory_status(account_id, store, "banking_sessions")
+            result = graph.invoke(current_state, config=config)
+            # Show all messages except the echoed HumanMessage (tool calls + results + final)
+            non_human = [m for m in result["messages"] if not isinstance(m, HumanMessage)]
+            print_messages(non_human)
+
+            current_state["fraud_flags"]       = result.get("fraud_flags", [])
+            current_state["loan_context"]      = result.get("loan_context", {})
+            current_state["session_summary"]   = result.get("session_summary", "")
+            current_state["interaction_count"] = result.get("interaction_count", 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -840,12 +1010,18 @@ if __name__ == "__main__":
         "in a banking customer-experience agent.[/dim]\n"
     )
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "single"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "chat"
 
-    if mode == "supervisor":
+    if mode == "chat":
+        agent_mode = sys.argv[2] if len(sys.argv) > 2 else "supervisor"
+        run_chat(agent_mode)
+    elif mode == "supervisor":
         run_supervisor_demo()
+    elif mode == "single":
+        run_single_agent_demo()
     elif mode == "both":
         run_single_agent_demo()
-    else:
         run_supervisor_demo()
+    else:
+        run_chat("supervisor")
         run_single_agent_demo()
