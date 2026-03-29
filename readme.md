@@ -134,6 +134,96 @@ Each specialist agent receives only the tools relevant to its domain, ensuring t
 
 ---
 
+## Cost & Memory Design Decisions
+
+### Memory is Context, Not a Cache — Deliberate Design Choice
+
+A common expectation is that "storing in memory" means the agent will skip the LLM for repeated questions and return a cached answer. **This project deliberately does not do that.** The `InMemoryStore` stores compressed summaries of prior interactions, which are injected into the system prompt as background context — the LLM still runs for every query, and banking tools are always called for fresh live data.
+
+This is a conscious design choice for a banking domain:
+
+> Account balances, fraud flags, and loan eligibility change in real time. Serving a cached response to "what is my balance?" would be incorrect and potentially harmful.
+
+The memory panel in the terminal makes this explicit:
+
+```
+→ This context is INJECTED into the LLM prompt.
+→ Tools will still be called for fresh, live data — memory does NOT replace tool calls.
+```
+
+**What memory does provide:**
+- The LLM knows the customer's account ID, prior fraud cases, and ongoing loan applications without the user repeating them
+- Cross-session continuity — a returning customer picks up where they left off
+- Per-account namespace isolation — ACC001 context never leaks into ACC002
+
+---
+
+### How COMPRESS Reduces LLM Cost
+
+The real cost optimisation in this project is the **COMPRESS strategy**, not response caching. Without compression, every LLM call would include the entire conversation history, which grows unboundedly:
+
+| Scenario | Without COMPRESS | With COMPRESS |
+|----------|-----------------|---------------|
+| After 10 turns | ~8,000 tokens per call | ~1,500 tokens per call |
+| After 30 turns | ~25,000 tokens per call | ~1,500 tokens per call |
+| Context limit hit? | Yes (GPT-4o: 128k) | Practically never |
+
+**How it works:**
+
+Every 3 turns (single agent) or every 3 queries per account (supervisor), `compress_node` runs:
+
+1. Sends the full history to the LLM with a summarisation prompt → produces a ~3–5 sentence summary
+2. Persists that summary to `InMemoryStore` (WRITE)
+3. Replaces the message list with just the last 6 messages
+
+On the next turn, only the compact summary + 6 recent messages are sent — not the full history. Cost stays **bounded and predictable** regardless of session length.
+
+---
+
+### Adding Semantic / Exact-Match Response Caching (Not Implemented)
+
+If you want to skip LLM calls for identical or semantically similar queries, LangChain provides built-in caching that can be layered on top of this project. This makes sense for **static queries** (e.g. "what are your UPI limits?" which is policy-based and doesn't change per user).
+
+**Option 1 — Exact-match in-memory cache** (identical string → same response):
+
+```python
+from langchain.globals import set_llm_cache
+from langchain_community.cache import InMemoryCache
+
+set_llm_cache(InMemoryCache())
+llm = ChatOpenAI(model="gpt-4o-mini")   # cache is applied automatically
+```
+
+**Option 2 — Semantic cache** (similar queries → same response, based on embedding similarity):
+
+```python
+from langchain_community.cache import InMemorySemanticCache
+from langchain_openai import OpenAIEmbeddings
+
+set_llm_cache(InMemorySemanticCache(
+    embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
+    score_threshold=0.95,   # tune similarity threshold
+))
+```
+
+**Option 3 — Persistent cache with Redis** (survives restarts, shared across instances):
+
+```python
+from langchain_community.cache import RedisSemanticCache
+
+set_llm_cache(RedisSemanticCache(
+    redis_url="redis://localhost:6379",
+    embedding=OpenAIEmbeddings(),
+))
+```
+
+**Important caveats for banking:**
+- Cache must be **keyed per account** if responses are account-specific (balance, transactions). LangChain's global cache does not do this automatically.
+- Cache should have a **TTL** (time-to-live) so stale balances or fraud statuses expire.
+- Only cache responses to static policy questions (UPI limits, loan eligibility criteria, FD rates). Never cache live account data queries.
+
+---
+
 ## Mock Data
 
 The demo uses three pre-loaded accounts:
